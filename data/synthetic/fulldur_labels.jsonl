@@ -1,0 +1,3 @@
+{"qid":"fd-001","video_id":"stub-spoken","query":"full video answerable query","answerable":true,"gold_windows":[[0.0,30.0]],"qtype":"visual","multi_event":false,"neg_type":null,"author":"synthetic","verifier":"synthetic"}
+{"qid":"fd-002","video_id":"stub-spoken","query":"something that never happens in this video","answerable":false,"gold_windows":[],"qtype":null,"multi_event":false,"neg_type":"ood","author":"synthetic","verifier":"synthetic"}
+
