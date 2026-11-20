@@ -1,0 +1,2 @@
+"""vi package initialization."""
+

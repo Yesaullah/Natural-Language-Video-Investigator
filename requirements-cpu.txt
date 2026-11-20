@@ -1,0 +1,7 @@
+# Minimal reproducible CPU dependencies for M1
+numpy>=1.26.0
+scipy>=1.12.0
+pydantic>=2.7.0
+pillow>=10.0.0
+pytest>=8.0.0
+

@@ -1,0 +1,21 @@
+# Generated index files and binaries
+index/
+*.sqlite
+*.npy
+*.jpg
+*.jpeg
+*.png
+
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Testing and environments
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+env/
+venv/
+
