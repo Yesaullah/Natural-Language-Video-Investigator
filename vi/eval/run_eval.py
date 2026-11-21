@@ -1,19 +1,6 @@
-"""B0 baseline evaluation harness for Natural-Language Video Investigator.
+"""Development evaluation for B0 and B1, with synthetic fixtures by default.
 
-Entry point: python -m vi.eval.run_eval --split dev --systems B0
-
-Implements M3 from plans/M3-evaluation-harness.md:
-- Loads synthetic development labels and stub indexes
-- Runs B0 (1,000-trial seeded random-window baseline)
-- Computes all §6.1 metrics with §6.2 uncertainty
-- Writes strict JSON to results/dev_B0.json
-
-B0 conventions (documented here per the brief):
-  - B0 always answers (no abstention signal): abstained=False for every result.
-  - All five candidates use a single common confidence (0.5 exactly).
-  - Candidates are returned in random generation order (no re-ranking).
-  - Raw and abstention-aware retrieval therefore coincide.
-  - Routing scores and GPU measurements are recorded as null with an applicability note.
+B0 keeps the M3 seeded trial, confidence, ranking and JSON conventions.
 """
 
 from __future__ import annotations
@@ -22,8 +9,9 @@ import argparse
 import hashlib
 import json
 import math
-import sys
+import os
 import time
+from tempfile import NamedTemporaryFile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -55,7 +43,7 @@ from vi.eval.validate_labels import (
 )
 
 # ── constants ──────────────────────────────────────────────────────────────────
-SUPPORTED_SYSTEMS = ("B0",)
+SUPPORTED_SYSTEMS = ("B0", "B1")
 SUPPORTED_SPLITS = ("dev",)
 
 # Default fixture paths (relative to repo root)
@@ -313,6 +301,7 @@ def run_b0_evaluation(
     bootstrap_n: int = B0_BOOTSTRAP_N,
     gen_seed: int = B0_GEN_SEED,
     bootstrap_seed: int = B0_BOOTSTRAP_SEED,
+    *, details: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """Run the B0 baseline and return a JSON-serialisable metrics dict."""
 
@@ -326,6 +315,9 @@ def run_b0_evaluation(
         labels, video_meta, length_pool,
         n_trials=n_trials, gen_seed=gen_seed,
     )
+
+    if b0_dict.keys() != {(q.video_id, q.qid) for q in labels} or len(b0_dict) != len(labels):
+        raise ValueError("B0 prediction keys do not match unique evaluation query keys")
 
     # ── 2. First-trial predictions (for trial-invariant metrics) ──────────────
     first_trial = _first_trial_results(labels, b0_dict)
@@ -597,6 +589,16 @@ def run_b0_evaluation(
         },
     }
 
+    if details is not None:
+        details.update(
+            query_keys=sorted(b0_dict),
+            first_trial=dict(zip(((q.video_id, q.qid) for q in labels), first_trial, strict=True)),
+            trial_means={
+                "R@1_iou0.3": pq_r1_03, "R@1_iou0.5": pq_r1_05, "R@1_iou0.7": pq_r1_07,
+                "R@5_iou0.3": pq_r5_03, "R@5_iou0.5": pq_r5_05, "R@5_iou0.7": pq_r5_07,
+                "MRR": pq_mrr, "top_window_mean_iou": pq_top_iou,
+            },
+        )
     return report
 
 
@@ -605,20 +607,20 @@ def run_b0_evaluation(
 def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "M3 evaluation harness.  Default run is synthetic (stub indexes + synthetic labels).\n"
+            "Development evaluation harness.  Default run is synthetic (stub indexes + synthetic labels).\n"
             "Example: python -m vi.eval.run_eval --split dev --systems B0"
         )
     )
     parser.add_argument(
         "--split", default="dev",
-        help="Evaluation split (only 'dev' is supported in M3; default: dev).",
+        help="Evaluation split (only 'dev' is supported; default: dev).",
     )
     parser.add_argument(
         "--systems", default="B0",
-        help="Comma-separated list of systems to evaluate (only B0 supported; default: B0).",
+        help="Comma-separated list of systems to evaluate (B0, B1, or B0,B1; default: B0).",
     )
     parser.add_argument(
-        "--index-root", type=Path, default=_STUB_INDEX_ROOT,
+        "--index-root", type=Path,
         help=f"Root directory containing per-video index folders (default: {_STUB_INDEX_ROOT}).",
     )
     parser.add_argument(
@@ -629,6 +631,9 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--label-file", type=Path, default=None,
         help="Override path to the label JSONL fixture (default: data/synthetic/dev_labels.jsonl).",
     )
+    parser.add_argument("--mode", choices=("synthetic", "real"), default="synthetic")
+    parser.add_argument("--manifest", type=Path, help="M2 JSON split manifest for real development.")
+    parser.add_argument("--b1-settings", type=Path, help="Fitted JSON settings required to score real B1.")
     parser.add_argument(
         "--n-trials", type=int, default=B0_N_TRIALS,
         help=f"Number of B0 trials per query (default: {B0_N_TRIALS}).",
@@ -648,75 +653,186 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _write_report(output: Path, report: dict) -> None:
+    if os.name == "nt":
+        # Use extended-length paths for directory creation, temp files and replacement.
+        absolute = os.path.abspath(output)
+        if absolute.startswith(("\\\\?\\", "\\\\.\\")):
+            output = Path(absolute)
+        elif absolute.startswith("\\\\"):
+            output = Path("\\\\?\\UNC\\" + absolute[2:])
+        else:
+            output = Path("\\\\?\\" + absolute)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = None
+    try:
+        with NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=output.parent, suffix=".json.tmp", delete=False,
+        ) as stream:
+            temp_path = Path(stream.name)
+            json.dump(report, stream, indent=2, allow_nan=False)
+        temp_path.replace(output)
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+
 def main(argv: Optional[List[str]] = None) -> None:
     args = _parse_args(argv)
-
-    # ── 0. Reject unsupported splits / systems before opening any data ────────
     split = args.split.strip().lower()
     reject_unsupported_split(split)
+    systems = sorted(s.strip() for s in args.systems.split(","))
+    for system in systems:
+        reject_unsupported_system(system, SUPPORTED_SYSTEMS)
+    if len(systems) != len(set(systems)):
+        raise ValueError("Duplicate evaluation systems")
+    if args.n_bootstrap < 1:
+        raise ValueError("n_bootstrap must be positive")
+    if "B0" in systems and args.n_trials < 1:
+        raise ValueError("n_trials must be positive")
 
-    systems = [s.strip() for s in args.systems.split(",")]
-    for sys_name in systems:
-        reject_unsupported_system(sys_name, SUPPORTED_SYSTEMS)
+    real = args.mode == "real"
+    manifest_hash = None
+    fitted = None
+    if real:
+        from vi.manifest import verify_manifest_integrity
+        from vi.schema import SplitManifest
 
-    # ── 1. Determine label file and index directories ─────────────────────────
-    label_path = args.label_file or _FIXTURE_LABELS[split]
-    index_root = args.index_root
+        if not all((args.manifest, args.label_file, args.index_root)):
+            raise ValueError("Real development requires --manifest, --label-file and --index-root")
+        manifest_bytes = args.manifest.read_bytes()
+        manifest = SplitManifest.model_validate_json(manifest_bytes)
+        dataset = manifest.dataset
+        if dataset not in {"team", "charades-sta"}:
+            raise ValueError(f"Unsupported development dataset {dataset!r}")
+        verify_manifest_integrity(manifest)
+        manifest_hash = hashlib.sha256(manifest_bytes).hexdigest()
+        video_ids = sorted(r.video_id for r in manifest.records if r.split == split)
+        index_root = args.index_root
+        label_path = args.label_file
+    else:
+        if args.manifest or args.b1_settings:
+            raise ValueError("--manifest and --b1-settings require explicit --mode real")
+        dataset = "synthetic"
+        video_ids = _STUB_VIDEO_IDS
+        index_root = args.index_root or _STUB_INDEX_ROOT
+        label_path = args.label_file or _FIXTURE_LABELS[split]
 
-    # Discover index directories from the stub video list
-    index_dirs: Dict[str, Path] = {}
-    for vid in _STUB_VIDEO_IDS:
-        d = index_root / vid
-        if not d.exists():
-            raise FileNotFoundError(
-                f"Index directory not found: {d}. "
-                "Run 'python scripts/make_stub_index.py' first."
-            )
-        index_dirs[vid] = d
-
-    # ── 2. Load and validate labels ───────────────────────────────────────────
-    labels = load_labels_from_jsonl(label_path)
+    index_dirs = {video: index_root / video for video in video_ids}
+    if not real:
+        for directory in index_dirs.values():
+            if not directory.exists():
+                raise FileNotFoundError(
+                    f"Index directory not found: {directory}. Run 'python scripts/make_stub_index.py' first."
+                )
+    labels = sorted(load_labels_from_jsonl(label_path), key=lambda q: (q.video_id, q.qid))
     video_meta = validate_labels_and_indexes(labels, index_dirs)
+    expected_split = split if real else "synthetic"
+    for video, metadata in video_meta.items():
+        if (metadata.dataset, metadata.split) != (dataset, expected_split):
+            raise ValueError(f"Index dataset or split mismatch for {video}")
 
-    # ── 3. Build gold-window length pool ──────────────────────────────────────
-    length_pool = build_gold_length_pool(labels)
+    applicability = {}
+    applicable = True
+    report_name = f"{split}_{','.join(systems)}"
+    if "B1" in systems:
+        from vi.eval.transcript_eval import (
+            VideoDraws, b0_subgroups, charades_applicability, load_b1_indexes, run_b1, spoken_comparison,
+        )
 
-    # ── 4. Run evaluation for each requested system ───────────────────────────
-    for sys_name in systems:
-        if sys_name == "B0":
-            report = run_b0_evaluation(
-                labels=labels,
-                video_meta=video_meta,
-                length_pool=length_pool,
-                n_trials=args.n_trials,
-                bootstrap_n=args.n_bootstrap,
-                gen_seed=args.gen_seed,
-                bootstrap_seed=args.bootstrap_seed,
+        loaded_indexes, index_load_seconds = load_b1_indexes(index_dirs, video_meta, synthetic=not real)
+        if real and dataset == "charades-sta":
+            applicability = charades_applicability(loaded_indexes)
+            applicable = applicability["applicable"]
+        if real and applicable:
+            from vi.search.settings import RealSettings
+
+            if not args.b1_settings:
+                raise ValueError("Real B1 development requires --b1-settings")
+            fitted = RealSettings.model_validate_json(args.b1_settings.read_bytes())
+            fitted.validate_fit()
+            if fitted.dataset != dataset:
+                raise ValueError("B1 fitted settings dataset does not match the manifest")
+            canonical = json.dumps(fitted.model_dump(mode="json"), sort_keys=True, separators=(",", ":"), allow_nan=False)
+            digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:24]
+            report_name += f"_{fitted.search.variant}_{digest}"
+        elif not applicable:
+            report_name += "_inapplicable"
+
+    b0_details = {} if systems == ["B0", "B1"] else None
+    if "B0" in systems:
+        b0 = run_b0_evaluation(
+            labels, video_meta, build_gold_length_pool(labels),
+            n_trials=args.n_trials, bootstrap_n=args.n_bootstrap,
+            gen_seed=args.gen_seed, bootstrap_seed=args.bootstrap_seed, details=b0_details,
+        )
+        b0["n_candidates_per_trial"] = B0_N_CANDIDATES
+        if real:
+            b0.update(dataset=dataset, synthetic=False, fixture_mode=None)
+            del b0["fixture_note"]
+
+    if "B1" in systems:
+        if applicable or b0_details is not None:
+            draws = VideoDraws(labels, args.n_bootstrap, args.bootstrap_seed)
+        b1 = dict(applicability)
+        if applicable:
+            metrics, predictions = run_b1(
+                labels, loaded_indexes, fitted, draws, args.bootstrap_seed, index_load_seconds=index_load_seconds,
             )
-            # Add CLI-level metadata
-            report["n_candidates_per_trial"] = B0_N_CANDIDATES
+            b1.update(metrics)
+        answerable = sum(q.answerable for q in labels)
+        run_metadata = {
+            "dataset": dataset, "split": split, "synthetic": not real,
+            "fixture_mode": None if real else "synthetic", "systems": systems,
+            "video_ids": video_ids, "video_count": len(video_ids), "query_count": len(labels),
+            "answerable_count": answerable, "unanswerable_count": len(labels) - answerable,
+            "query_keys": [(q.video_id, q.qid) for q in labels],
+            "label_sha256": hashlib.sha256(label_path.read_bytes()).hexdigest(),
+            "manifest_sha256": manifest_hash,
+            "seeds": {"bootstrap": args.bootstrap_seed},
+            "bootstrap_count": args.n_bootstrap,
+            "bootstrap_population": (
+                "Sample all selected dev videos with replacement. Include each sampled video's "
+                "eligible queries with multiplicity. Weight queries equally. Draws without "
+                "eligible queries are undefined. Variation from rebuilding indexes is unmeasured."
+            ),
+        }
+        if not real:
+            run_metadata["fixture_note"] = "Synthetic labels and embeddings check integration only."
+        if b0_details is None:
+            report = {**run_metadata, **b1}
+        else:
+            report = {
+                **run_metadata, "system_reports": {"B0": b0, "B1": b1},
+                "B0_subgroups": b0_subgroups(labels, b0_details, draws),
+            }
+            if applicable:
+                if b0_details["query_keys"] != b1["query_keys"]:
+                    raise ValueError("B0 and B1 query keys differ")
+                comparison = spoken_comparison(
+                    labels, b0_details["trial_means"]["R@1_iou0.5"], predictions, draws,
+                )
+                comparison["B1_variant"] = b1["settings"]["variant"]
+                report["spoken_comparison"] = comparison
+    else:
+        report = b0
+        if real:
+            report["manifest_sha256"] = manifest_hash
 
-            # ── 5. Write output ONLY after validation and calculation succeed ──
-            output_dir = args.output_dir
-            output_dir.mkdir(parents=True, exist_ok=True)
-            output_path = output_dir / f"{split}_{sys_name}.json"
-
-            # Write to temp path first, then rename to avoid partial writes
-            tmp_path = output_path.with_suffix(".json.tmp")
-            with open(tmp_path, "w", encoding="utf-8") as fh:
-                json.dump(report, fh, indent=2, allow_nan=False)
-            tmp_path.replace(output_path)
-
-            print(f"[run_eval] Report written to {output_path}")
-            print(f"[run_eval] Elapsed: {report['cpu_timing']['elapsed_s']:.1f}s")
-            print(f"[run_eval] Videos: {report['video_count']}, "
-                  f"Queries: {report['query_count']} "
-                  f"(answerable={report['answerable_count']}, unanswerable={report['unanswerable_count']})")
-            print(f"[run_eval] R@1 IoU0.5 (trial mean): {report['retrieval']['trial_mean']['R@1_iou0.5']:.4f}")
-            print(f"[run_eval] R@5 IoU0.5 (trial mean): {report['retrieval']['trial_mean']['R@5_iou0.5']:.4f}")
-            print(f"[run_eval] MRR: {report['retrieval']['trial_mean']['MRR']:.4f}")
-            print(f"[run_eval] Balanced accuracy: {report['abstention']['balanced_accuracy']}")
-            print(f"[run_eval] Risk-coverage area: {report['risk_coverage']['area']}")
+    output_dir = args.output_dir / dataset if real else args.output_dir
+    output_path = output_dir / f"{report_name}.json"
+    _write_report(output_path, report)
+    print(f"[run_eval] Report written to {output_path}")
+    print(f"[run_eval] Videos: {report['video_count']}, Queries: {report['query_count']} "
+          f"(answerable={report['answerable_count']}, unanswerable={report['unanswerable_count']})")
+    if "B0" in systems:
+        print(f"[run_eval] B0 R@1 IoU0.5 (trial mean): {b0['retrieval']['trial_mean']['R@1_iou0.5']:.4f}")
+    if "B1" in systems:
+        if applicable:
+            rate = b1["retrieval"]["raw"]["R@1_iou0.5"]["rate"]
+            print(f"[run_eval] B1 raw R@1 IoU0.5: {rate}")
+        else:
+            print(f"[run_eval] B1 inapplicable. {b1['reason']}")
 
 
 if __name__ == "__main__":
